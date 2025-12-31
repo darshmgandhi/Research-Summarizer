@@ -3,6 +3,7 @@ import json
 import re
 import time
 from difflib import SequenceMatcher
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
@@ -32,6 +33,60 @@ def fetch_url(url, timeout=15, retries=2, backoff=1.0):
 
 def text_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+def extract_gs_result_links(html: str, base_url: str = "https://scholar.google.com"):
+    """
+    Parse a Google Scholar search result HTML and extract ONLY the main
+    result links from each result card. Avoids sidebar/profile/auxiliary links.
+
+    Strategy:
+    - Select results under #gs_res_ccl with containers having classes
+      'gs_r' and 'gs_or' (these are individual results).
+    - For each result, take the anchor in h3.gs_rt (the main title link).
+    - Resolve relative URLs against base_url.
+    """
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    links = []
+
+    # Only result cards (skip the top "User profiles" block which lacks gs_or)
+    for card in soup.select("#gs_res_ccl .gs_r.gs_or"):
+        a = card.select_one("h3.gs_rt a[href]")
+        if not a:
+            continue
+        href = a.get("href", "").strip()
+        if not href:
+            continue
+        # Normalize to absolute URL
+        if href.startswith("/"):
+            href = requests.compat.urljoin(base_url, href)
+            print(f"\033[31mRESOLVED RELATIVE URL TO: {href}\033[0m")
+        links.append(href)
+
+    # Verification: parse the header "About N results (T sec)" and compare
+    header_el = soup.select_one("#gs_ab_md .gs_ab_mdw") or soup.select_one("#gs_ab_md")
+    total_results = None
+    if header_el:
+        header_text = header_el.get_text(" ", strip=True)
+        m = re.search(r"([\d,]+)\s+results?", header_text, flags=re.I)
+        if m:
+            try:
+                total_results = int(m.group(1).replace(",", ""))
+            except Exception:
+                total_results = None
+
+    if total_results is not None:
+        expected = min(10, total_results)
+        if expected == len(links):
+            print("Verified")
+        else:
+            print(f"\033[31mERROR: expected {expected} links, got {len(links)} (total {total_results})\033[0m")
+    else:
+        print(f"\033[31mERROR: Could not find total results for the google scholar results\033[0m")
+    return links
 
 
 def _clean_university_cell_text(td) -> str:
@@ -159,10 +214,27 @@ def extract_professors_from_profBySchool(matched_name: str):
     return results
 
 
+def _sanitize_filename(name: str) -> str:
+    """Make a safe file name for Windows by removing reserved characters."""
+    if not name:
+        return "untitled"
+    # Remove Windows-forbidden characters <>:"/\|?*
+    name = re.sub(r'[<>:"/\\|?*]+', "_", name)
+    # Collapse whitespace and dots
+    name = re.sub(r"\s+", " ", name).strip().strip(".")
+    # Truncate to a reasonable length
+    return name[:180] if len(name) > 180 else name
+
+
+def _page_title_from_html(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    t = soup.title.string if soup.title else ""
+    return (t or "").strip()
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("university", help="University name to search for (partial match allowed)")
-    p.add_argument("-o", "--output", help="Optional output file to save JSON results")
     args = p.parse_args()
 
     query = args.university
@@ -188,12 +260,57 @@ def main():
     text = json.dumps(out, indent=2, ensure_ascii=False)
     print(text)
     print(len(professors), "professors found in the following subfields:", ", ".join(ALLOWED_SUBFIELDS))
+    print("Fetching Google Scholar pages for each professor...")
 
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(text)
-        print(f"Results written to {args.output}")
+    for prof in out["professors"]:
+        gs_url = prof.get("google scholar")
+        gs_url_2025 = gs_url.replace("as_ylo=", "as_ylo=2025")
+        if gs_url == gs_url_2025:
+            raise Exception("Google Scholar URL not replaced.")
+        prof["gs_results_2025"] = fetch_url(gs_url_2025, timeout=10)
 
+    # Step 2: extract only the main result links from each professor's 2025 results
+    print("Extracting result links from Google Scholar pages...")
+    for prof in out["professors"]:
+        html = prof.get("gs_results_2025")
+        prof["gs_urls_2025"] = extract_gs_result_links(html)
+
+    # Step 3: fetch each extracted URL and save as text files under data/<University_Professor>/<Page Title>.txt
+    print("Fetching and saving research material from individual results...")
+    base_dir = Path(__file__).parent / "data"
+    uni_name = out.get("matched_university", "UnknownUniversity")
+    for prof in out["professors"]:
+        prof_name = prof.get("name", "UnknownProfessor")
+        prof_dir = base_dir / f"{_sanitize_filename(uni_name)}_{_sanitize_filename(prof_name)}"
+        prof_dir.mkdir(parents=True, exist_ok=True)
+
+        for url in prof.get("gs_urls_2025"):
+            try:
+                page_html = fetch_url(url, timeout=15)
+            except Exception as e:
+                print(f"Warning: failed to fetch {url}: {e}")
+                continue
+
+            title = _page_title_from_html(page_html)
+            if not title:
+                # Fallback to URL path if no title
+                parsed = requests.utils.urlparse(url)
+                title = parsed.netloc + parsed.path
+            file_name = _sanitize_filename(title) + ".txt"
+            file_path = prof_dir / file_name
+
+            if file_path.exists():
+                print(f"Warning: file already exists, skipping: {file_path}")
+                continue
+
+            try:
+                file_path.write_text(page_html, encoding="utf-8")
+            except Exception as e:
+                print(f"Warning: failed to write {file_path}: {e}")
+
+    with open("professors.json", "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
+        print(f"Results written to {f.name}")
 
 if __name__ == "__main__":
     main()

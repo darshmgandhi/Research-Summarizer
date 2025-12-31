@@ -2,6 +2,9 @@
 __pycache__/
 *.py[codz]
 *$py.class
+/data/*
+!/data/.gitkeep
+professors.json
 
 # C extensions
 *.so
