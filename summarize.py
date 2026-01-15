@@ -14,8 +14,10 @@ PROFBYSCHOOL_URL = "https://drafty.cs.brown.edu/csopenrankings/frontend/profBySc
 ALLOWED_SUBFIELDS = ["ai", "vision", "ir", "mlmining", "nlp"]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; cs-openrankings-scraper/1.0; +https://example.com)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.5993.90 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
 }
+
 
 
 def fetch_url(url, timeout=15, retries=2, backoff=1.0):
@@ -285,11 +287,17 @@ def main():
         prof_dir.mkdir(parents=True, exist_ok=True)
 
         for url in prof.get("gs_urls_2025"):
+
+            if "arxiv.org" in url.lower():
+                url =url.replace("https://arxiv.org/abs", "https://arxiv.org/pdf")
+
             try:
                 page_html = fetch_url(url, timeout=15)
             except Exception as e:
                 print(f"Warning: failed to fetch {url}: {e}")
                 continue
+
+
 
             title = _page_title_from_html(page_html)
             if not title:
