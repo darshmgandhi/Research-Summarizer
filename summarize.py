@@ -4,6 +4,7 @@ import re
 import time
 from difflib import SequenceMatcher
 from pathlib import Path
+import traceback
 
 import requests
 from bs4 import BeautifulSoup
@@ -302,24 +303,13 @@ def fetch_arxiv_text(url: str, timeout: int = 20, retries: int = 2, backoff: flo
             content = resp.content  # bytes
 
             if "application/pdf" in content_type or url.lower().endswith(".pdf"):
-                try:
-                    pdfminer_high_level = importlib.import_module("pdfminer.high_level")
-                    text = pdfminer_high_level.extract_text(BytesIO(content))
-                    return text or ""
-                except Exception as e:
-                    # If PDF parsing fails, fall back to raw bytes decode
-                    last_err = e
-                    try:
-                        return content.decode(resp.encoding or "utf-8", errors="ignore")
-                    except Exception:
-                        return ""
+                pdfminer_high_level = importlib.import_module("pdfminer.high_level")
+                text = pdfminer_high_level.extract_text(BytesIO(content))
+                return text
             else:
-                # Not a PDF; return as HTML text
-                try:
-                    return content.decode(resp.encoding or "utf-8", errors="ignore")
-                except Exception:
-                    return resp.text
+                raise Exception(f"Non-PDF content-type from arXiv: {content_type}")
         except Exception as e:
+            print(traceback.format_exc())
             last_err = e
             if attempt == retries:
                 raise
@@ -344,7 +334,7 @@ def main():
         return
 
     print(f"Best match: {matched_name}")
-    print("Extracting professors from profBySchool.js...")
+    print("Extracting professors from CS Open Rankings...")
 
     professors = extract_professors_from_profBySchool(matched_name)
 
@@ -360,7 +350,7 @@ def main():
     print(len(professors), "professors found in the following subfields:", ", ".join(ALLOWED_SUBFIELDS))
     print("Fetching Google Scholar pages for each professor...")
 
-    for prof in out["professors"]:
+    for prof in out["professors"][:2]:
         gs_url = prof.get("google scholar")
         gs_url_2025 = gs_url.replace("as_ylo=", "as_ylo=2025")
         if gs_url == gs_url_2025:
