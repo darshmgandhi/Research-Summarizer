@@ -7,6 +7,12 @@ from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
+from io import BytesIO
+import importlib
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
 
 BASE_URL = "https://drafty.cs.brown.edu/csopenrankings/"
 PROFBYSCHOOL_URL = "https://drafty.cs.brown.edu/csopenrankings/frontend/profBySchool.js"
@@ -19,18 +25,49 @@ HEADERS = {
 }
 
 
+def _setup_selenium_driver():
+    """Set up and return a Selenium Chrome driver."""
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")  # Run in headless mode
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument(f"--user-agent={HEADERS['User-Agent']}")
+    
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    return driver
+
 
 def fetch_url(url, timeout=15, retries=2, backoff=1.0):
-    for attempt in range(retries + 1):
+    # Use Selenium for Google Scholar URLs to bypass blocking
+    if "scholar.google.com" in url:
+        driver = None
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=timeout)
-            resp.raise_for_status()
-            return resp.text
-        except Exception:
-            if attempt == retries:
-                raise
-            time.sleep(backoff * (attempt + 1))
-    raise RuntimeError("unreachable")
+            driver = _setup_selenium_driver()
+            driver.get(url)
+            # Wait a bit for the page to load
+            time.sleep(2)
+            return driver.page_source
+        except Exception as e:
+            if driver:
+                driver.quit()
+            raise e
+        finally:
+            if driver:
+                driver.quit()
+    else:
+        # Use requests for other URLs
+        for attempt in range(retries + 1):
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=timeout)
+                resp.raise_for_status()
+                return resp.text
+            except Exception:
+                if attempt == retries:
+                    raise
+                time.sleep(backoff * (attempt + 1))
+        raise RuntimeError("unreachable")
 
 
 def text_similarity(a: str, b: str) -> float:
@@ -234,6 +271,65 @@ def _page_title_from_html(html: str) -> str:
     return (t or "").strip()
 
 
+def _is_arxiv_pdf_url(url: str) -> bool:
+    try:
+        parsed = requests.utils.urlparse(url)
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+        return "arxiv.org" in host and "/pdf/" in path
+    except Exception:
+        return False
+
+
+def fetch_arxiv_text(url: str, timeout: int = 20, retries: int = 2, backoff: float = 1.0) -> str:
+    """Fetch an arXiv URL and return extracted plain text.
+
+    - If it's a PDF response, extract text via pdfminer.six
+    - If it's HTML (rate-limit or error page), return the HTML text
+    """
+    # Ensure we hit the PDF endpoint and end with .pdf for arXiv
+    if url.startswith("https://arxiv.org/abs"):
+        url = url.replace("https://arxiv.org/abs", "https://arxiv.org/pdf")
+    if _is_arxiv_pdf_url(url) and not url.lower().endswith(".pdf"):
+        url = url + ".pdf"
+
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=timeout, stream=True)
+            resp.raise_for_status()
+            content_type = (resp.headers.get("Content-Type", "").lower())
+            content = resp.content  # bytes
+
+            if "application/pdf" in content_type or url.lower().endswith(".pdf"):
+                try:
+                    pdfminer_high_level = importlib.import_module("pdfminer.high_level")
+                    text = pdfminer_high_level.extract_text(BytesIO(content))
+                    return text or ""
+                except Exception as e:
+                    # If PDF parsing fails, fall back to raw bytes decode
+                    last_err = e
+                    try:
+                        return content.decode(resp.encoding or "utf-8", errors="ignore")
+                    except Exception:
+                        return ""
+            else:
+                # Not a PDF; return as HTML text
+                try:
+                    return content.decode(resp.encoding or "utf-8", errors="ignore")
+                except Exception:
+                    return resp.text
+        except Exception as e:
+            last_err = e
+            if attempt == retries:
+                raise
+            time.sleep(backoff * (attempt + 1))
+    # Should not reach, but return empty if somehow we do
+    if last_err:
+        raise last_err
+    return ""
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("university", help="University name to search for (partial match allowed)")
@@ -270,6 +366,7 @@ def main():
         if gs_url == gs_url_2025:
             raise Exception("Google Scholar URL not replaced.")
         prof["gs_results_2025"] = fetch_url(gs_url_2025, timeout=10)
+        print(f"Fetched Google Scholar results for {prof.get('name')}")
 
     # Step 2: extract only the main result links from each professor's 2025 results
     print("Extracting result links from Google Scholar pages...")
@@ -288,16 +385,19 @@ def main():
 
         for url in prof.get("gs_urls_2025"):
 
-            if "arxiv.org" in url.lower():
-                url =url.replace("https://arxiv.org/abs", "https://arxiv.org/pdf")
-
-            try:
-                page_html = fetch_url(url, timeout=15)
-            except Exception as e:
-                print(f"Warning: failed to fetch {url}: {e}")
-                continue
-
-
+            # For arXiv, fetch and parse PDF into text
+            if _is_arxiv_pdf_url(url) or ("arxiv.org" in url.lower()):
+                try:
+                    page_html = fetch_arxiv_text(url, timeout=20)
+                except Exception as e:
+                    print(f"Warning: failed to fetch/parse arXiv content {url}: {e}")
+                    continue
+            else:
+                try:
+                    page_html = fetch_url(url, timeout=15)
+                except Exception as e:
+                    print(f"Warning: failed to fetch {url}: {e}")
+                    continue
 
             title = _page_title_from_html(page_html)
             if not title:
